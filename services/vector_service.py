@@ -1,70 +1,82 @@
 import os
 import uuid
+import re
 from fastembed import TextEmbedding
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownTextSplitter
 from database.vector_db import get_pinecone_index
 
 # Initialize the local CPU model
-# This will download the ~80MB model automatically on the very first run
+# This downloads ~80MB model on the very first run
 print("--> [SYSTEM] Initializing Local FastEmbed Engine...")
 embedding_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+def clean_markdown(text: str):
+    """Cleans up excessive whitespace but PRESERVES all links for the chatbot to use."""
+    print("--> [DEBUG] Cleaning whitespace (keeping links intact)...")
+    
+    # Replace multiple newlines with a single double-newline
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Replace multiple spaces with a single space
+    text = re.sub(r' {2,}', ' ', text)
+    
+    return text.strip()
+
 def chunk_text(text: str):
-    print(f"--> [DEBUG] Chunking text of length: {len(text)} characters.")
-    splitter = RecursiveCharacterTextSplitter(
+    clean_text = clean_markdown(text)
+    
+    print(f"--> [DEBUG] Chunking text of length: {len(clean_text)} characters.")
+    
+    # Intelligently splits by headers and paragraphs, not just random character counts
+    splitter = MarkdownTextSplitter(
         chunk_size=1000,
-        chunk_overlap=100,
-        separators=["\n\n", "\n", " ", ""]
+        chunk_overlap=150
     )
-    chunks = splitter.split_text(text)
-    print(f"--> [DEBUG] Successfully created {len(chunks)} chunks.")
+    
+    chunks = splitter.split_text(clean_text)
+    print(f"--> [DEBUG] Successfully created {len(chunks)} contextual chunks.")
     return chunks
 
 async def process_and_store(customer_id: str, url: str, markdown_text: str):
-    print("--> [DEBUG] Starting process_and_store (Local FastEmbed)...")
     chunks = chunk_text(markdown_text)
-    
     if not chunks:
-        print("--> [DEBUG] ERROR: No chunks created. The scraped text was empty!")
         return 0
 
-    print(f"--> [DEBUG] Running local CPU embeddings for {len(chunks)} chunks...")
-    try:
-        # FastEmbed generates the numbers locally without the internet
-        embeddings_generator = embedding_model.embed(chunks)
-        embeddings = list(embeddings_generator)
-        print(f"--> [DEBUG] Local Embedding Success! Generated {len(embeddings)} vectors.")
-    except Exception as e:
-        print(f"--> [DEBUG] FASTEMBED FATAL ERROR: {e}")
-        raise e
-
-    print("--> [DEBUG] Connecting to Pinecone...")
     index = get_pinecone_index()
-    vectors = []
+    total_saved = 0
     
-    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-        chunk_id = f"{customer_id}-{uuid.uuid4()}"
-        vectors.append({
-            "id": chunk_id,
-            # .tolist() converts the local numpy math into standard numbers for Pinecone
-            "values": emb.tolist(), 
-            "metadata": {
-                "customer_id": customer_id,
-                "url": url,
-                "text": chunk
-            }
-        })
+    # --- THE RAM SAVER ---
+    # We process and upload exactly 50 chunks at a time. 
+    # This prevents the list() from consuming all your laptop's memory.
+    batch_size = 50 
 
-    print(f"--> [DEBUG] Upserting {len(vectors)} vectors to Pinecone (Namespace: '{customer_id}')...")
-    batch_size = 100
-    try:
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch, namespace=customer_id)
-            print(f"--> [DEBUG] Uploaded batch of {len(batch)} vectors to Pinecone.")
-        print("--> [DEBUG] Pinecone upsert complete!")
-    except Exception as e:
-        print(f"--> [DEBUG] PINECONE FATAL ERROR: {e}")
-        raise e
+    print(f"--> [DEBUG] Streaming embeddings to Pinecone in batches of {batch_size}...")
+    
+    for i in range(0, len(chunks), batch_size):
+        chunk_batch = chunks[i:i + batch_size]
+        
+        # 1. Generate embeddings JUST for this small batch locally
+        embeddings_generator = embedding_model.embed(chunk_batch)
+        embeddings = list(embeddings_generator)
+        
+        # 2. Prepare Pinecone Payload
+        vectors = []
+        for j, (chunk, emb) in enumerate(zip(chunk_batch, embeddings)):
+            chunk_id = f"{customer_id}-{uuid.uuid4()}"
+            vectors.append({
+                "id": chunk_id,
+                "values": emb.tolist(),
+                "metadata": {
+                    "customer_id": customer_id,
+                    "url": url,
+                    "text": chunk
+                }
+            })
+            
+        # 3. Upload to Pinecone immediately and let Python clear the memory
+        index.upsert(vectors=vectors, namespace=customer_id)
+        total_saved += len(vectors)
+        print(f"--> [DEBUG] Uploaded batch... ({total_saved}/{len(chunks)} total vectors saved)")
 
-    return len(chunks)
+    print("--> [DEBUG] Pipeline Complete. Memory freed.")
+    return total_saved
