@@ -1,36 +1,40 @@
 from fastapi import APIRouter, HTTPException
-from services.scraper import crawl_and_scrape
+from services.scraper import suck_website_data
 from services.vector_service import process_and_store
+from database.vector_db import get_pinecone_index
 
 router = APIRouter()
 
 @router.post("/ingest")
-async def ingest_url(url: str, customer_id: str = "demo_user_01", max_pages: int = 10):
+async def ingest_url(url: str, customer_id: str = "demo_user_01"):
     print("\n==================================================")
-    print(f"🚀 NEW DOMAIN CRAWL REQUEST: {url}")
+    print(f"🚀 NEW ENTERPRISE INGEST REQUEST: {url}")
     print("==================================================")
     
     try:
-        print(f"--> [STEP 1] Starting Autonomous Crawler (Max {max_pages} pages)...")
-        # Trigger the spider instead of the single scraper
-        crawled_pages = await crawl_and_scrape(url, max_pages)
+        print("--> [STEP 1] Deploying Domain Crawler...")
+        # The scraper now returns a list of dictionaries containing URLs and content
+        crawled_pages = await suck_website_data(url, max_pages=15)
         
-        if not crawled_pages:
-            print("--> [STEP 1 FAILED] Crawler returned no content.")
-            raise HTTPException(status_code=500, detail="Crawler failed to extract any text.")
+        if not crawled_pages or len(crawled_pages) == 0:
+            print("--> [STEP 1 FAILED] Crawler found no valid content.")
+            raise HTTPException(status_code=500, detail="Could not extract content from the provided domain.")
 
-        print(f"--> [STEP 1 SUCCESS] Successfully mapped and scraped {len(crawled_pages)} pages.")
+        print(f"--> [STEP 1 SUCCESS] Retrieved {len(crawled_pages)} pages from the domain.")
+        print("--> [STEP 2] Initializing Vector Pipeline...")
 
-        print("--> [STEP 2] Sending all pages to Vector Service...")
         total_chunks_saved = 0
-
-        # Loop through the list of dictionaries returned by the crawler
+        
+        # Loop through every crawled page and vectorize it
         for page in crawled_pages:
-            # Send each page's specific URL and content to Pinecone
-            chunks_saved = await process_and_store(customer_id, page["url"], page["content"])
+            page_url = page["url"]
+            page_content = page["content"]
+            
+            print(f"    -> Vectorizing: {page_url}")
+            chunks_saved = await process_and_store(customer_id, page_url, page_content)
             total_chunks_saved += chunks_saved
 
-        print(f"--> [STEP 3] Finished! {total_chunks_saved} total chunks saved to DB across {len(crawled_pages)} pages.")
+        print(f"--> [STEP 3] Finished! {total_chunks_saved} total vectors mapped to Pinecone.")
         print("==================================================\n")
 
         return {
@@ -43,19 +47,17 @@ async def ingest_url(url: str, customer_id: str = "demo_user_01", max_pages: int
     except Exception as e:
         print(f"--> [FATAL ERROR] Pipeline crashed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @router.delete("/delete")
 async def delete_url_data(url: str, customer_id: str):
+    # ... keep your existing delete logic exactly as is ...
     print(f"\n--> [SYSTEM] Request to delete vectors for: {url}")
     try:
         index = get_pinecone_index()
-        
-        # Pinecone allows us to delete vectors based on the metadata we injected earlier!
         index.delete(
             namespace=customer_id,
             filter={"source_url": {"$eq": url}}
         )
-        
         print("--> [SUCCESS] Vectors purged from Pinecone.")
         return {"status": "Success", "message": "Knowledge base deleted."}
     except Exception as e:
