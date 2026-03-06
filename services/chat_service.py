@@ -118,7 +118,7 @@ class ConversationalAI:
         # Filter and rank
         knowledge = []
         for match in results['matches']:
-            if match['score'] > 0.7:  # Relevance threshold
+            if match['score'] > 0.45:  # Relevance threshold
                 knowledge.append({
                     "text": match['metadata']['text'],
                     "source": match['metadata'].get('source_url', 'documentation'),

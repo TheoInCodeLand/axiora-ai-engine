@@ -1,65 +1,83 @@
-from fastapi import APIRouter, HTTPException
-from services.scraper import suck_website_data
+# routes/ingest.py
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
+from services.scraper import crawl_and_scrape
 from services.vector_service import process_and_store
 from database.vector_db import get_pinecone_index
 
 router = APIRouter()
 
 @router.post("/ingest")
-async def ingest_url(url: str, customer_id: str = "demo_user_01"):
-    print("\n==================================================")
-    print(f"NEW ENTERPRISE INGEST REQUEST: {url}")
-    print("==================================================")
+async def ingest_url(
+    url: str, 
+    customer_id: str = "demo_user_01",
+    max_pages: int = Query(default=500, ge=1, le=5000),  # ✅ Add limits
+    dynamic: bool = True,
+    wait_for_api: Optional[str] = Query(default=None, description="API pattern to wait for, e.g., /api/tours")
+):
+    print("\n" + "="*60)
+    print(f"🚀 INGEST REQUEST")
+    print(f"   URL: {url}")
+    print(f"   Max Pages: {max_pages}")
+    print(f"   Dynamic: {dynamic}")
+    print(f"   API Pattern: {wait_for_api or 'None'}")
+    print("="*60)
     
     try:
-        print("--> [STEP 1] Deploying Domain Crawler...")
-        # The scraper now returns a list of dictionaries containing URLs and content
-        crawled_pages = await suck_website_data(url, max_pages=15)
+        if not dynamic:
+            # Static fallback (implement if needed)
+            raise HTTPException(status_code=400, detail="Static mode not implemented, use dynamic=true")
         
-        if not crawled_pages or len(crawled_pages) == 0:
-            print("--> [STEP 1 FAILED] Crawler found no valid content.")
-            raise HTTPException(status_code=500, detail="Could not extract content from the provided domain.")
-
-        print(f"--> [STEP 1 SUCCESS] Retrieved {len(crawled_pages)} pages from the domain.")
-        print("--> [STEP 2] Initializing Vector Pipeline...")
-
-        total_chunks_saved = 0
+        # Use dynamic scraper
+        crawled_pages = await crawl_and_scrape(
+            base_url=url,
+            max_pages=max_pages,
+            wait_for_api_pattern=wait_for_api
+        )
         
-        # Loop through every crawled page and vectorize it
+        if not crawled_pages:
+            raise HTTPException(
+                status_code=422,
+                detail="No content extracted. The site may block scrapers or require JavaScript."
+            )
+        
+        print(f"\n📊 Processing {len(crawled_pages)} pages to vectors...")
+        
+        total_chunks = 0
         for page in crawled_pages:
             page_url = page["url"]
             page_content = page["content"]
-            
-            print(f"    -> Vectorizing: {page_url}")
-            chunks_saved = await process_and_store(customer_id, page_url, page_content)
-            total_chunks_saved += chunks_saved
+            chunks = await process_and_store(customer_id, page_url, page_content)
+            total_chunks += chunks
+            print(f"   💾 {page_url}: {chunks} chunks")
 
-        print(f"-------> [STEP 3] Finished! {total_chunks_saved} total vectors mapped to Pinecone.")
-        print("==================================================\n")
+        print(f"\n✅ Total: {total_chunks} chunks saved")
 
         return {
             "status": "Success",
             "base_url": url,
             "pages_crawled": len(crawled_pages),
             "customer_id": customer_id,
-            "chunks_saved_to_db": total_chunks_saved
+            "chunks_saved_to_db": total_chunks
         }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"--> [FATAL ERROR] Pipeline crashed: {e}")
+        print(f"❌ Ingestion failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/delete")
 async def delete_url_data(url: str, customer_id: str):
-    # ... keep your existing delete logic exactly as is ...
-    print(f"\n--> [SYSTEM] Request to delete vectors for: {url}")
+    print(f"\n🗑️  Delete request: {url}")
     try:
         index = get_pinecone_index()
         index.delete(
             namespace=customer_id,
             filter={"source_url": {"$eq": url}}
         )
-        print("--> [SUCCESS] Vectors purged from Pinecone.")
+        print("✅ Vectors deleted")
         return {"status": "Success", "message": "Knowledge base deleted."}
     except Exception as e:
-        print(f"--> [FATAL ERROR] Failed to delete from Pinecone: {e}")
+        print(f"❌ Delete failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
